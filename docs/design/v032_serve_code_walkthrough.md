@@ -3,12 +3,19 @@
 ## 분석 범위와 읽는 순서
 
 분석 기준 revision은 `v0.32.0`의
-`5df63a7203cdb9328d824a27b682e77c7b9928be`이다. 아래 링크는 모두 이 commit에
-고정했다.
+`5df63a7203cdb9328d824a27b682e77c7b9928be`이다. 소스 URL은 모두
+`blob/v0.32.0/` 태그를 기준으로 달았다. commit ID는 로컬 분석 대상의 기록이다.
 
-범위는 Python frontend, 단일 API 서버, data parallel 크기 1, GPU 하나인 일반 경로다.
-`--headless`, gRPC, Rust frontend, 다중 API 서버는 이 경로를 바꾼다. 모델과
-GPU를 지정하지 않았으므로 특정 모델 class나 CUDA kernel은 분석 대상이 아니다.
+Python frontend를 기준으로 단일 API 서버부터 읽고 다중 API 서버와 비교한다.
+별도 표시가 없는 요청 예시는 TP=PP=DP=1, GPU 하나인 일반적인 텍스트 생성 경로다.
+Rust frontend, gRPC, headless 경로는 다루지 않는다. 특정 모델과 GPU는 지정하지
+않았으므로 attention backend의 커널은 실제 선택 결과가 아니라 구현 예로 설명한다.
+
+Python frontend와 V1/V2 model runner는 서로 다른 선택이다. FastAPI와 `AsyncLLM`은
+Python frontend에 속하고, model runner는 EngineCore 안에서 GPU 실행을 준비한다.
+본문의 자료구조는 이 태그가 지원 조건에서 선택하는 V2 runner 기준이다.
+이전 runner의 대응 파일은 [`gpu_model_runner.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu_model_runner.py)와
+[`gpu_input_batch.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu_input_batch.py)다.
 
 이 문서는 소스 분석 결과다. 모델 다운로드, 서버 실행, GPU 추론 검증은 하지 않았다.
 서버 시작을 먼저 따라가고, 그 뒤 `POST /v1/chat/completions` 요청 하나를 끝까지 추적한다.
@@ -41,12 +48,12 @@ model execution을 가진다. 기본 `uni` executor에서는 worker가 EngineCor
 ## 1. 콘솔 명령은 `cli.main:main`에서 `serve` subcommand를 고른다
 
 `pyproject.toml`은 `vllm` console script를
-[`vllm.entrypoints.cli.main:main`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/pyproject.toml#L42-L43)에
+[`vllm.entrypoints.cli.main:main`](https://github.com/vllm-project/vllm/blob/v0.32.0/pyproject.toml#L42-L43)에
 연결한다. `main`은 argument parser로 subcommand를 고른 뒤
 `ServeSubcommand.cmd(args)`를 호출한다.
 
 이 문서의 핵심 분기는
-[`vllm/entrypoints/cli/serve.py:65-156`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/cli/serve.py#L65-L156)에
+[`vllm/entrypoints/cli/serve.py:65-156`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/cli/serve.py#L65-L156)에
 있다. 이 함수는 model positional argument를 반영한 뒤 gRPC, headless, Rust
 frontend, data parallel load balancing을 구분한다.
 
@@ -81,10 +88,74 @@ else:
 parallel 크기가 2 이상이면 기본 API server 수도 그 크기와 같아져
 `run_multi_api_server` 경로가 선택된다.
 
+### 단일 API server와 다중 API server는 model replica 수와 다른 축이다
+
+이 문서는 Python frontend를 기준으로 한다. `VLLM_USE_RUST_FRONTEND=0`이면
+`api_server_count`가 Python API process 수를 정한다. data parallel 크기(DP)는
+EngineCore와 model replica의 수를 정하는 별도 설정이다.
+
+| 예 | API process 수 | EngineCore/model replica 수 | 의미 |
+| --- | --- | --- | --- |
+| 기본값, `DP=1` | 1 | 1 | CLI process가 API server와 engine client를 직접 실행한다. |
+| `--api-server-count 2`, `DP=1` | 2 | 1 | supervisor가 Python API child 둘을 시작한다. 두 child는 한 model replica에 연결한다. |
+| 기본값, `DP=2` | 2 | 2 | API process와 DP engine 수가 함께 2가 된다. |
+
+두 번째 행은 model weight를 두 번 올리는 설정이 아니다. `run_multi_api_server`는
+먼저 socket을 만들고 `EngineCore`를 시작한 뒤, `APIServerProcessManager`로 API
+child process를 만든다. 관련 흐름은
+[`serve.py:270-385`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/cli/serve.py#L270-L385)에
+있다. API child마다 별도 ZMQ input/output listener가 있지만, `DP=1`이면 모두
+하나의 engine으로 향한다.
+
+```mermaid
+flowchart LR
+    P[Python supervisor] --> A1[API child 1]
+    P --> A2[API child 2]
+    A1 -->|ZMQ| E[one EngineCore, DP=1]
+    A2 -->|ZMQ| E
+    E --> M[one model replica]
+```
+
+API child들은 같은 HTTP listener를 상속받는다. `NoSignalServer`는 열린 연결 수를
+보고 accept를 잠시 미뤄 비교적 덜 바쁜 child를 고른다. 이는 연결 단위의 최선 노력
+균형이고, keep-alive 연결의 뒤 요청을 다른 child로 옮기는 요청 단위 라우팅은 아니다.
+이 동작은 [`launcher.py:36-138`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/launcher.py#L36-L138)에 있다.
+
+각 child는 별도 FastAPI app state와 `AsyncLLM` frontend 상태를 가진다. supervisor는
+child 수와 index를 engine configuration에 넣고, child마다 ZMQ listener 쌍을 넘긴다.
+engine output에는 `client_index`가 들어가 원래 요청을 보낸 frontend로 돌아간다.
+이 연결 구성은 [`serve.py:305-385`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/cli/serve.py#L305-L385)와
+[`core_client.py:1238-1301`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py#L1238-L1301)에 있다.
+engine과 API child의 종료도 supervisor와 각 child의 lifecycle을 따라 분리된다.
+
+실제로 child를 만드는 함수는
+[`APIServerProcessManager.__init__`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/utils.py#L167-L270)이다.
+`spawn`으로 child를 만들며 같은 HTTP socket과 서로 다른 `client_index`를 전달한다.
+child는 `run_api_server_worker_proc`에서 앞서 본 `run_server_worker`로 들어간다.
+각 child에 tokenizer, renderer, 결과 collector가 생기므로 CPU 전처리와 응답 처리는
+여러 프로세스에서 수행할 수 있다. 그만큼 frontend 상태의 메모리도 별도로 필요하다.
+
+각 child가 `AsyncLLM`을 만들어도 엔진을 다시 띄우지는 않는다.
+[`MPClient.__init__`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py#L628-L688)는
+`client_addresses`가 있으면 부모가 준비한 엔진과 소켓을 사용한다. 주소가 없는
+단일 API 경로에서만 client가 직접 `launch_core_engines`에 들어간다.
+
+DP가 2 이상인 내부 LB 경로에서는
+[`DPLBAsyncMPClient.get_core_engine_for_request`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py#L1642-L1702)가
+요청을 보낼 엔진을 고른다. 이 선택은 HTTP 연결을 받을 API child 선택과 별개다.
+`API child 0 → DP rank 0`처럼 항상 고정되는 관계도 아니다. TP와 PP는 각 엔진의
+모델 실행 worker 구성을 바꾸며, API process 수를 직접 정하지 않는다.
+
+단일 API에서는 `run_server_worker`의 engine context가 엔진 수명을 관리한다.
+다중 API에서는 부모가 API manager, engine manager, DP coordinator를 감시하고
+[`serve.py`의 종료 처리](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/cli/serve.py#L385-L407)에서 각각 정리한다.
+API process를 늘리면 GPU 계산량이나 처리량이 반드시 같은 비율로 늘어난다는 뜻은 아니다.
+이 문서는 프로세스 구조를 확인했으며 성능 비교는 실행하지 않았다.
+
 ## 2. `run_server`는 listen 전에 socket을 bind하고 worker를 호출한다
 
 `run_server`는
-[`entry.py:165-178`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/api_server/entry.py#L165-L178)에
+[`entry.py:165-178`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/api_server/entry.py#L165-L178)에
 있다. 이 함수는 API server 로그 label을 설정한다. 또한 Uvicorn이 signal
 handler를 설치하기 전 `SIGTERM`이 오면 초기화를 중단하는 임시 handler를
 설치한다.
@@ -97,14 +168,14 @@ await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
 ```
 
 `setup_server`는
-[`launchers/launcher.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/launcher.py)
+[`launchers/launcher.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/launcher.py)
 에 있다. 이 함수는 버전과 비기본 인자를 로그에 남기고 parser plugin을
 import하며 인자를 검증한다. 이어 `create_server_socket`으로 socket을
 `bind()`한다. 그 다음 file-descriptor limit을 설정하고 `(listen_address,
 sock)`를 반환한다.
 
 `create_server_socket`의
-[bind 코드](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/launcher.py#L335-L350)는
+[bind 코드](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/launcher.py#L335-L350)는
 socket에 주소를 연결할 뿐 요청을 받지 않는다. HTTP serve loop는 나중에
 `serve_http`가 이 socket을 Uvicorn에 전달할 때 시작한다. 따라서 포트 bind
 실패와 model initialization 실패는 서로 다른 시작 단계의 오류다.
@@ -112,7 +183,7 @@ socket에 주소를 연결할 뿐 요청을 받지 않는다. HTTP serve loop는
 ## 3. `run_server_worker`가 plugin, engine, socket 수명을 관리한다
 
 `run_server_worker`는
-[`entry.py:180-207`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/api_server/entry.py#L180-L207)에
+[`entry.py:180-207`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/api_server/entry.py#L180-L207)에
 있다. 이 함수는 지정된 tool parser와 reasoning parser plugin을 import한다.
 여러 API process가 같은 engine을 공유하면 `client_config`에서 peer load
 counter도 읽는다.
@@ -141,7 +212,7 @@ finally:
 ## 4. `Namespace`는 `AsyncEngineArgs`를 거쳐 `VllmConfig`가 된다
 
 `build_async_engine_client`는
-[`entry.py:36-68`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/api_server/entry.py#L36-L68)에서
+[`entry.py:36-68`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/api_server/entry.py#L36-L68)에서
 CLI `Namespace`를 `AsyncEngineArgs`로 바꾼다. 여러 API process가 있을 때는
 여기서 API process count와 rank도 넣는다.
 
@@ -155,7 +226,7 @@ async with build_async_engine_client_from_engine_args(
 ```
 
 `build_async_engine_client_from_engine_args`는
-[`entry.py:70-114`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/api_server/entry.py#L70-L114)에
+[`entry.py:70-114`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/api_server/entry.py#L70-L114)에
 있다. 여기서 `create_engine_config`는 model, cache, parallel, scheduler,
 device 설정을 `VllmConfig`로 묶는다. 설정 validation이 먼저 완료된 뒤
 `AsyncLLM.from_vllm_config`를 무조건 호출한다.
@@ -177,7 +248,7 @@ route는 준비되지 않는다. context의 `finally`에서는 생성된 `async_
 ## 5. `AsyncLLM`은 frontend 변환기와 EngineCore client를 만든다
 
 `AsyncLLM.__init__`의
-[초기화 코드](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/async_llm.py#L145-L192)는
+[초기화 코드](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/async_llm.py#L145-L192)는
 다음 순서다. 아래는 인자 일부를 생략한 실제 줄의 발췌다.
 
 ```python
@@ -201,12 +272,12 @@ self.engine_core = EngineCoreClient.make_async_mp_client(
 마지막 호출은 normal serving의 EngineCore background process를 시작한다.
 `AsyncLLM`은 API process에 남고 `AsyncMPClient`는 ZMQ input/output socket을
 통해 engine과 통신한다. client 선택 코드는
-[`core_client.py:135-170`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core_client.py#L135-L170)에
+[`core_client.py:135-170`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py#L135-L170)에
 있다.
 
-조금 더 내려가면 [`MPClient.__init__`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core_client.py#L609-L753)가
+조금 더 내려가면 [`MPClient.__init__`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py#L609-L753)가
 통신 소켓을 준비하고 `launch_core_engines` context에 들어간다.
-[`launch_core_engines`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/utils.py#L1197-L1270)는
+[`launch_core_engines`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/utils.py#L1197-L1270)는
 설정에 맞는 엔진 프로세스들을 띄우고 준비 상태를 기다린다. 여기서 프로세스 생성과
 통신 준비가 끝나야 `AsyncLLM` 생성이 다음 단계로 진행된다.
 
@@ -214,7 +285,7 @@ self.engine_core = EngineCoreClient.make_async_mp_client(
 
 child process는 `EngineCoreProc.run_engine_core`로 들어간다. 이 함수는
 `EngineCore`를 생성하고 busy loop를 실행한다. 시작 지점은
-[`core.py:1390-1496`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L1390-L1496)다.
+[`core.py:1390-1496`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L1390-L1496)다.
 
 `EngineCore.__init__`의 핵심 호출은 다음과 같다. 인자와 후속 optional
 component는 생략했다.
@@ -231,12 +302,12 @@ self.scheduler = Scheduler(
 ```
 
 코드는
-[`core.py:150-258`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L150-L258)에
+[`core.py:150-258`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L150-L258)에
 있다. scheduler가 request를 받기 전에 executor가 model과 worker를 준비하고,
 KV cache가 memory budget에 맞게 준비되어야 한다.
 
 기본 world size 1은 `UniProcExecutor`를 고른다. 근거는
-[`parallel.py:1079-1080`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/parallel.py#L1079-L1080)다.
+[`parallel.py:1079-1080`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/parallel.py#L1079-L1080)다.
 `UniProcExecutor._init_executor`는 `WorkerWrapperBase`를 만들고 다음 순서로
 worker method를 호출한다.
 
@@ -247,7 +318,7 @@ self.driver_worker.load_model()
 ```
 
 이 코드는
-[`uniproc_executor.py:44-75`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/executor/uniproc_executor.py#L44-L75)에
+[`uniproc_executor.py:44-75`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/executor/uniproc_executor.py#L44-L75)에
 있다. concrete GPU worker는 `vllm.v1.worker.gpu_worker.Worker`다.
 
 ## 7. model load는 runner 선택 뒤 loader와 architecture 초기화로 이어진다
@@ -256,7 +327,7 @@ self.driver_worker.load_model()
 `Worker._make_model_runner`는 설정에 따라 model runner를 고른다. V2 runner를
 쓸 수 있는 경우 `vllm.v1.worker.gpu.model_runner.GPUModelRunner`를 만든다.
 선택 위치는
-[`gpu_worker.py:547-581`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu_worker.py#L547-L581)다.
+[`gpu_worker.py:547-581`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu_worker.py#L547-L581)다.
 
 V2 runner의 `load_model`은 loader를 얻어 모델 객체를 만들고 weight를 채운다. 실제 경로는 다음과 같다.
 
@@ -275,13 +346,13 @@ Worker.load_model
 
 `BaseModelLoader`는 먼저 architecture에 맞는 model object를 만들고, 그 뒤
 weight를 채운다. V2 `load_model`은
-[`model_runner.py:378`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py#L378)에
+[`model_runner.py:378`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L378)에
 있다. loader의 base 구현은
-[`base_loader.py:63`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/model_loader/base_loader.py#L63)에
+[`base_loader.py:63`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/model_executor/model_loader/base_loader.py#L63)에
 있다. model initialization은
-[`model_loader/utils.py:74`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/model_loader/utils.py#L74)에서,
+[`model_loader/utils.py:74`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/model_executor/model_loader/utils.py#L74)에서,
 architecture 선택은
-[`utils.py:334`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/model_loader/utils.py#L334)에서
+[`utils.py:334`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/model_executor/model_loader/utils.py#L334)에서
 확인할 수 있다.
 
 이 모델은 서버 시작 시 준비하고 요청들이 공유한다. 일반적인 채팅 요청을 받을
@@ -289,13 +360,13 @@ architecture 선택은
 
 V2 runner 선택은 항상 보장되지 않는다. Triton 지원 여부, 비호환 기능, 환경
 override가 선택을 바꿀 수 있다. 조건은
-[`vllm.py:703-742`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L703-L742)에
+[`vllm.py:703-742`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/vllm.py#L703-L742)에
 있다. 이 조건이 맞지 않으면 이전
 `vllm.v1.worker.gpu_model_runner.GPUModelRunner`가 사용된다.
 
 V2 runner의 `execute_model`과 `sample_tokens`는 각각
-[`model_runner.py:1719`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py#L1719)와
-[`model_runner.py:2088`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py#L2088)에
+[`model_runner.py:1719`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1719)와
+[`model_runner.py:2088`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L2088)에
 있다. 실제 attention kernel은 model architecture, dtype, platform, backend에
 따라 달라진다.
 
@@ -310,37 +381,37 @@ GPU block 수를 정한다. 설정을 worker에 전달한 뒤 model compile, war
 graph capture가 필요한 경우 그 작업도 수행한다.
 
 전체 코드는
-[`core.py:261-389`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L261-L389)에
+[`core.py:261-389`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L261-L389)에
 있다. READY 응답은 effective `max_model_len`, GPU KV block 수, block size를
 frontend로 돌려준다. CLI의 model length가 auto-fit 과정 뒤에도 그대로라고
 가정하면 안 된다.
 
 frontend에 이 값을 적용하는 곳은
-[`MPClient._apply_ready_response`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core_client.py#L829-L872)다.
+[`MPClient._apply_ready_response`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py#L829-L872)다.
 여기까지 성공해야 API 계층도 엔진이 실제로 사용할 입력 길이와 캐시 용량을 알게 된다.
 
 ## 9. scheduler와 batch queue의 실제 선택은 effective config를 봐야 한다
 
 v0.32.0에서 `step()` 하나를 기본 실행 경로라고 단정하면 안 된다.
 `max_concurrent_batches`의 기본값 결정은
-[`vllm.py:577-589`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L577-L589)에
+[`vllm.py:577-589`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/vllm.py#L577-L589)에
 있다. `EngineCore`는 이 값에 따라 `step` 또는 `step_with_batch_queue`를
 고른다. 선택 코드는
-[`core.py:242`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L242)에
+[`core.py:242`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L242)에
 있다.
 
 또한 async scheduling은 incompatible option이 없을 때 기본으로 켜질 수 있다.
 설정 결정은
-[`vllm.py:1585-1644`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L1585-L1644)에
+[`vllm.py:1585-1644`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/vllm.py#L1585-L1644)에
 있다. scheduler class 선택은
-[`scheduler.py:228-253`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/scheduler.py#L228-L253)에
+[`scheduler.py:228-253`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/scheduler.py#L228-L253)에
 있다. 요청 분석 시에는 실행 로그와 effective configuration으로 이 두 선택을
 먼저 확인해야 한다.
 
 ## 10. route 등록과 handler state 주입은 다른 단계다
 
 `build_and_serve`는 EngineCore 준비 뒤 FastAPI application을 만든다. 코드는
-[`entry.py:116-162`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/api_server/entry.py#L116-L162)에
+[`entry.py:116-162`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/api_server/entry.py#L116-L162)에
 있다.
 
 ```python
@@ -366,17 +437,17 @@ build_app
 ```
 
 `build_app`은
-[`app.py:19`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/app.py#L19)에,
+[`app.py:19`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/app.py#L19)에,
 router 등록은
-[`app.py:45`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/app.py#L45)에
+[`app.py:45`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/app.py#L45)에
 있다. 이 단계는 endpoint를 application에 붙인다.
 
 `init_app_state`는 등록된 route가 사용할 handler dependency를 채운다.
 `init_generate_state`는 `OpenAIServingChat`을 만들고
 `state.openai_serving_chat`에 넣는다. 시작점은
-[`generate/api_router.py:55`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/generate/api_router.py#L55),
+[`generate/api_router.py:55`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/generate/api_router.py#L55),
 chat handler 주입은
-[`generate/api_router.py:149-151`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/generate/api_router.py#L149-L151)에
+[`generate/api_router.py:149-151`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/generate/api_router.py#L149-L151)에
 있다. route 등록과 runtime handler 주입을 같은 작업으로 보면 안 된다.
 
 ## 11. `serve_http`가 bind된 socket으로 Uvicorn을 실행한다
@@ -398,7 +469,7 @@ return dummy_shutdown()
 ```
 
 `serve_http` 구현은
-[`launcher.py:220-307`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/launchers/launcher.py#L220-L307)에
+[`launcher.py:220-307`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/launchers/launcher.py#L220-L307)에
 있다. `sockets=[sock]`가 앞서 bind한 socket을 Uvicorn에 전달하는 지점이다.
 `handle_shutdown`은 signal을 기다린 뒤 engine client shutdown을 호출하고
 `server_task`를 취소한다. `run_server_worker`가 받는 return 값은 이 함수가
@@ -461,7 +532,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 라우터는
-[`create_chat_completion`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/openai/chat_completion/api_router.py#L41-L80)이다.
+[`create_chat_completion`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/openai/chat_completion/api_router.py#L41-L80)이다.
 
 아래 발췌에서는 route의 부가 설정과 오류 분기를 생략했다.
 
@@ -488,7 +559,7 @@ task를 취소한다. `StreamingResponse`가 만들어진 뒤에는 Starlette �
 
 라우터가 호출한 `create_chat_completion`은 `_create_chat_completion`에 작업을
 위임한다. 여기서는 후자의 일반 생성 경로를 따라간다.
-[`OpenAIServingChat._create_chat_completion`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/openai/chat_completion/serving.py#L296-L415)이다.
+[`OpenAIServingChat._create_chat_completion`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/openai/chat_completion/serving.py#L296-L415)이다.
 
 다음은 오류 검사, 입력 반복문, 부가 인자를 생략한 발췌다.
 
@@ -511,8 +582,8 @@ generator = self.engine_client.generate(
 먼저 `render_chat_request`가 모델 이름을 확인하고 admission preflight를 한다.
 그 뒤 `OnlineRenderer.render_chat`을 호출한다. 이 함수는 tool choice와 chat
 template 인자를 검사하고, `preprocess_chat`으로 내려간다. 구현은
-[`serving.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/openai/chat_completion/serving.py#L258-L279),
-[`online_renderer.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/renderers/online_renderer.py#L224-L317)에 있다.
+[`serving.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/openai/chat_completion/serving.py#L258-L279),
+[`online_renderer.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/renderers/online_renderer.py#L224-L317)에 있다.
 
 여기서 messages, system prompt, tools를 모델의 chat template에 넣고 tokenizer를
 적용한다. 결과 `EngineInput`에는 적어도 prompt token IDs가 들어 있다. 이미지나
@@ -527,7 +598,7 @@ template 인자를 검사하고, `preprocess_chat`으로 내려간다. 구현은
 ### 3. `AsyncLLM.generate`는 frontend 상태와 엔진 요청을 함께 등록한다
 
 `engine_client`는 이 경로에서 `AsyncLLM`이다.
-[`generate`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/async_llm.py#L698-L809)는
+[`generate`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/async_llm.py#L698-L809)는
 먼저 `add_request`를 호출하고, 요청별 `RequestOutputCollector`를 async
 generator로 읽는다.
 
@@ -543,7 +614,7 @@ while not finished:
 ```
 
 `add_request`와 `_add_request`는
-[`async_llm.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/async_llm.py#L388-L640)에
+[`async_llm.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/async_llm.py#L388-L640)에
 있다. `InputProcessor`가 `EngineInput`을 검증하고 `EngineCoreRequest`를 만든다.
 기본 `max_tokens`가 없으면 prompt 길이를 뺀 모델 최대 길이를 사용한다.
 
@@ -562,7 +633,7 @@ tokenize하지 않는다.
 
 `AsyncMPClient.add_request_async`는 request에 client index를 기록하고 ADD를
 보낸다. 구현은
-[`core_client.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core_client.py#L1238-L1301)에
+[`core_client.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core_client.py#L1238-L1301)에
 있다.
 
 ```python
@@ -577,7 +648,7 @@ await self._send_input(EngineCoreRequestType.ADD, request)
 ADD message 뒤 input processing thread의 `preprocess_add_request`가
 `Request.from_engine_core_request`로 `EngineCoreRequest`를 `Request`로 바꾼다.
 그 결과가 input queue를 거쳐 `_handle_client_request`에 온다. 전처리 위치는
-[`core.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L1089-L1111)다.
+[`core.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L1089-L1111)다.
 다음은 ADD 분기 안에서 shutdown 검사를 생략한 발췌다.
 
 ```python
@@ -586,13 +657,13 @@ self.add_request(req, request_wave)
 ```
 
 dispatch 코드는
-[`core.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L1667-L1708)에
+[`core.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L1667-L1708)에
 있다. `add_request`는 이미 변환된 `Request`를 scheduler waiting queue에 넣는다.
 
 ### 5. scheduler는 prefill과 decode를 분리된 모드로 보지 않는다
 
 핵심 scheduler는
-[`Scheduler.schedule`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L594-L650)다.
+[`Scheduler.schedule`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/sched/scheduler.py#L594-L650)다.
 코드 주석처럼 scheduler에는 고정된 prefill phase와 decode phase가 없다. 요청마다
 `num_computed_tokens`와 `num_tokens_with_spec`의 차이를 줄이도록 token budget과
 KV block 여유 안에서 token 수를 배정한다.
@@ -616,11 +687,11 @@ response cache가 아니다. 새 요청은 계속 sampling과 응답 형식 변�
 ### 6. 기본 경로는 batch queue를 통해 실행될 수 있다
 
 v0.32.0은 호환 조건이 맞으면 async scheduling을 자동으로 켠다.
-[`vllm.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L1585-L1647)를
+[`vllm.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/vllm.py#L1585-L1647)를
 보면 pooling, 일부 speculative decoding, 지원하지 않는 executor 같은 조건에서만
 이를 끈다. 단일 GPU의 V2 model runner 조건에서는 concurrent batch 수가 2가 될
 수 있다. 계산식은
-[`vllm.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L577-L589)에
+[`vllm.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/vllm.py#L577-L589)에
 있다.
 
 그래서 EngineCore는 `step`만 항상 부르지 않는다.
@@ -632,8 +703,8 @@ self.step_fn = (
 ```
 
 선택 코드는
-[`core.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L228-L246)에
-있다. [`step_with_batch_queue`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L703-L818)는 새 batch 실행을 먼저 시작하고, queue가 찼거나 더
+[`core.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L228-L246)에
+있다. [`step_with_batch_queue`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L703-L818)는 새 batch 실행을 먼저 시작하고, queue가 찼거나 더
 넣을 수 없을 때 앞선 batch 결과를 받는다. fallback `step`은 같은 반복 안에서
 schedule, `execute_model`, 결과 처리 순서로 진행한다.
 
@@ -649,7 +720,7 @@ engine_core_outputs = self.scheduler.update_from_output(
 ```
 
 이 fallback 코드는
-[`core.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L657-L687)에
+[`core.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L657-L687)에
 있다.
 
 ### 7. executor와 model runner가 GPU forward와 sampling을 한다
@@ -657,7 +728,7 @@ engine_core_outputs = self.scheduler.update_from_output(
 world size가 1이면 기본 executor는 `uni`다. worker는 EngineCore 안의 객체다.
 별도 worker process가 항상 생기는 것은 아니다. V2 model runner는 Triton을 쓸 수
 있고 지원하지 않는 기능이 없으면 기본 선택 후보가 된다. 조건은
-[`vllm.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L703-L742)에
+[`vllm.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/vllm.py#L703-L742)에
 있다.
 
 V2 runner의 `execute_model`은 request state와 KV block table을 갱신하고, batch
@@ -665,7 +736,7 @@ descriptor와 attention metadata를 준비한 뒤 model forward를 실행한다.
 graph 모드면 graph replay를 하고, eager 또는 piecewise 모드면 `self.model` forward를
 호출한다.
 구현은
-[`gpu/model_runner.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py#L1719-L2087)다.
+[`gpu/model_runner.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1719-L2087)다.
 
 다음은 V2 runner에서 상태 갱신과 일반 forward 호출을 남긴 발췌다.
 두 구간 사이의 입력 준비와 CUDA graph 분기는 생략했다.
@@ -679,15 +750,269 @@ model_output = self.model(**model_inputs)
 
 그 다음 `sample_tokens`는 마지막 pipeline stage의 hidden states로 logits를 만들고,
 sampling parameter를 적용해 token ID를 뽑는다. 구현은
-[`sample_tokens`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py#L2088-L2175)와
-[`sample`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py#L1592-L1660)에
+[`sample_tokens`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L2088-L2175)와
+[`sample`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1592-L1660)에
 있다. 결과는 `ModelRunnerOutput`이다.
+
+### 7-1. 실행 batch의 token packing과 KV cache block은 다른 자료구조다
+
+시퀀스의 token을 묶는 과정과 KV cache를 할당하는 과정을 나누어 보자. 기본 KV cache
+`block_size`는 16 token이다. 이는 한 요청의 논리 token position을 KV cache의
+물리 page로 바꾸는 단위다. 반면 model forward에 넣는 실행 batch는 여러 요청의
+이번 step token을 길이 합만큼 평탄화한 1차원 tensor다. 실행 batch가 요청별로
+16 token으로 잘리거나 항상 16의 배수로 padding되지는 않는다.
+
+`CacheConfig.DEFAULT_BLOCK_SIZE = 16`은
+[`cache.py:72-78`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/cache.py#L72-L78)와
+[`cache.py:338-351`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/cache.py#L338-L351)에
+있다. 그러나 attention backend가 지원하는 크기와 hybrid model의 page alignment가
+이 값을 바꿀 수 있다. worker는 backend 선택 뒤 이 값을 조정한다. 코드는
+[`interface.py:750-805`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/platforms/interface.py#L750-L805)에
+있다. 따라서 실행 중인 값은 `VllmConfig.cache_config.block_size`와 startup log로
+확인해야 한다.
+
+또한 `BLOCK_SIZE=1024`와 `TRITON_BLOCK_SIZE=1024`가
+[`block_table.py:145-218`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/block_table.py#L145-L218)에
+보인다. 이것은 block table을 읽고 쓰는 Triton kernel의 반복 tile 크기다. KV
+cache page 크기인 `kv_block_size`와 같은 값이 아니다.
+
+| 이름 | 정하는 크기 |
+| --- | --- |
+| `max_num_batched_tokens` | 한 step에 처리할 입력 token의 budget |
+| `num_scheduled_tokens[req_id]` | 이번 step에서 해당 요청에 배정한 token 수 |
+| KV `block_size` | cache block 하나가 저장할 token position 수 |
+| `TRITON_BLOCK_SIZE` | 인덱스 계산 커널이 한 번에 다루는 작업 tile 크기 |
+
+#### step 사이에는 요청별 상태를 유지하고, step 안에서는 필요한 token만 모은다
+
+새 요청은 `NewRequestData`, 이전 step에서 이미 worker에 등록한 요청은
+`CachedRequestData`로 `SchedulerOutput`에 들어간다. 후자는 token 전체를 매번
+보내지 않고 주로 계산 위치, 새 block ID, output token 수를 보낸다. pipeline
+parallelism 등에서는 token update도 들어갈 수 있다. 자료구조 정의는
+[`output.py:35-210`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/sched/output.py#L35-L210)와
+[`output.py:232-320`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/sched/output.py#L232-L320)에
+있다.
+
+worker의 `RequestState`는 요청마다 고정 slot을 할당한다. `req_id_to_index`가
+request ID를 이 slot으로 바꾸고, `all_token_ids`는
+`[max_num_reqs, max_model_len]` 형태로 token history를 저장한다. 기본 설정에서는
+이 큰 배열을 GPU DRAM 대신 UVA backed memory로 둘 수 있다. 따라서 이것은 곧바로
+이번 forward의 GPU 입력 tensor라는 뜻이 아니다. 정의와 staged write는
+[`states.py:9-122`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/states.py#L9-L122)에
+있다.
+
+| 계층 | 자료구조와 shape | 이번 step에서 하는 일 |
+| --- | --- | --- |
+| scheduler | `SchedulerOutput.num_scheduled_tokens: dict[req_id, int]` | 요청별로 이번에 계산할 token 수를 정한다. |
+| worker 지속 상태 | `RequestState.all_token_ids[max_num_reqs, max_model_len]`, `num_computed_tokens[max_num_reqs]` | token history와 이미 계산한 길이를 요청 slot별로 보관한다. |
+| worker batch 상태 | `BatchReqState.req_ids`, `idx_mapping_np`, `num_scheduled_tokens` | 실행 순서와 지속 slot을 연결한다. |
+| GPU forward 입력 | `InputBatch.input_ids[T_padded]`, `positions[T_padded]`, `query_start_loc[R_padded+1]`, `seq_lens[R_padded]` | 유효 prefix `T`를 요청별 가변 길이 slice로 한 token 축에 concat한다. |
+| attention metadata | block table `[R_padded, max_num_blocks]`, slot mapping `[T_padded]` | 각 평탄 token을 요청의 KV page와 page 안 offset에 연결한다. |
+
+`T`와 `R`은 실제 token 수와 요청 수다. 실행 descriptor가 더 큰 크기를 요구하면
+`T_padded`, `R_padded`가 이보다 커질 수 있다. `InputBuffers` 자체는 설정된 최대 용량으로
+미리 잡아 두고, `InputBatch`는 그 앞 slice를 참조한다.
+
+`GPUModelRunner.gather_batch_req_state`는 `num_scheduled_tokens`에서 batch 순서와
+`idx_mapping`을 만든다. decode/verification 요청을 먼저, 짧은 extend와 prefill을
+뒤에 배치한다. 따라서 scheduler의 dict 삽입 순서가 GPU batch 순서라고 가정하면 안
+된다. 코드는 [`model_runner.py:1271-1352`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1271-L1352)와
+[`model_runner.py:2435-2447`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L2435-L2447)에 있다.
+
+`prepare_inputs`가 그 결과를 GPU input buffer에 채운다. 핵심은 누적합이다.
+
+```python
+np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
+prepare_prefill_inputs(
+    self.input_buffers.input_ids,
+    self.req_states.next_prefill_tokens,
+    idx_mapping,
+    query_start_loc,
+    self.req_states.all_token_ids.gpu,
+    self.req_states.prefill_len.gpu,
+    self.req_states.num_computed_tokens.gpu,
+)
+prepare_pos_seq_lens(
+    idx_mapping,
+    query_start_loc,
+    self.req_states.num_computed_tokens.gpu,
+    self.input_buffers.positions,
+    self.input_buffers.seq_lens,
+)
+```
+
+이 코드는 [`model_runner.py:1354-1546`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1354-L1546)에 있다. `query_start_loc`의
+인접한 두 원소는 한 요청 slice의 시작과 끝이다. attention backend는 이 offset과
+`seq_lens`를 받아, padding으로 맞춘 직사각형 `[R, max_query_len]` 대신 가변 길이
+입력을 해석한다.
+
+prefill token은 [`prepare_prefill_inputs`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/input_batch.py#L271-L345)가
+요청 상태의 `num_computed_tokens` 위치부터 읽어 packed slice에 복사한다.
+decode에서는 [`combine_sampled_and_draft_tokens`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/input_batch.py#L406-L503)가
+GPU의 `last_sampled_tokens`에서 다음 입력을 가져온다. 따라서 매 decode step마다
+전체 history를 CPU에서 다시 전송할 필요가 없다.
+
+#### 세 요청을 한 번의 forward에 packing하는 예
+
+다음 숫자는 구현을 읽기 위한 가상 예다. 실제 request ID, physical block ID,
+scheduler budget에서 측정한 값이 아니다. 가정은 normal causal attention,
+TP=PP=DP=1, speculative decoding과 context parallelism이 없고 KV `block_size=16`인
+경우다.
+
+| batch 순서 | 지속 request slot (`idx_mapping`) | 이번 step | 계산할 symbolic token | position | 논리 KV block |
+| --- | --- | --- | --- | --- | --- |
+| A | 5 | decode 1개 | `A16` | 16 | 1 |
+| B | 1 | prefill 2개 | `B0`, `B1` | 0, 1 | 0 |
+| C | 7 | prefill 마지막 chunk 3개 | `C14`, `C15`, `C16` | 14, 15, 16 | 0, 0, 1 |
+
+이 입력은 아래처럼 padding 없이 이어 붙인다.
+
+```text
+req_ids          = [A, B, C]
+idx_mapping      = [5, 1, 7]
+num_scheduled_tokens = [1, 2, 3]
+num_tokens       = 6
+query_start_loc  = [0, 1, 3, 6]
+input_ids        = [A16, B0, B1, C14, C15, C16]
+positions        = [16, 0, 1, 14, 15, 16]
+seq_lens         = [17, 2, 17]
+logits_indices   = [0, 2, 5]
+```
+
+여기서 `query_start_loc[1] - query_start_loc[0] == 1`은 A slice의 길이고,
+`query_start_loc[3] - query_start_loc[2] == 3`은 C slice의 길이다. A의 decode는
+한 token이고 C의 prefill은 세 token이지만, GPU 입력에는 둘 다 같은 1차원 배열의
+서로 다른 범위로 들어간다. `logits_indices`는 각 요청의 마지막 query token을
+가리켜 다음 token sampling에 쓸 hidden state를 고른다. 실제 코드는
+`combine_sampled_and_draft_tokens`가 이 인덱스를 만들며,
+[`model_runner.py:1467-1478`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1467-L1478)에 있다.
+이때 decode token A16은 매 step마다 history 전체를 다시 gather한 값이 아니다.
+runner는 `last_sampled_tokens`와 request state를 사용해 이 입력 위치를 채운다.
+
+이 flat 배열은 A, B, C가 한 대화로 이어진다는 뜻이 아니다. `query_start_loc`는
+각 요청의 query 경계를, `seq_lens`는 각 요청의 전체 context 길이를, block table의
+각 row는 해당 요청의 KV page만 가리킨다. `build_attn_metadata`는 이 값들로
+`CommonAttentionMetadata`를 만들고 attention backend별 metadata builder에 넘긴다.
+따라서 backend는 flat token 축을 읽되 request boundary와 request별 causal context를
+유지한다. 구현은 [`attn_utils.py:457-545`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/attn_utils.py#L457-L545)에 있다.
+
+#### 16-token block table이 token 위치를 KV cache 주소로 바꾼다
+
+예시에서 logical block table이 물리 block ID를 다음처럼 가리킨다고 하자.
+
+```text
+A: [7, 12]     # position 0..15 -> 7, 16..31 -> 12
+B: [3]         # position 0..15 -> 3
+C: [9, 4]      # position 0..15 -> 9, 16..31 -> 4
+```
+
+block size가 16일 때 보통 위치 `p`의 slot ID는 다음 관계를 따른다.
+
+```text
+logical_block = p // 16
+block_offset  = p % 16
+physical_id   = block_table[logical_block]
+slot_id       = physical_id * 16 + block_offset
+```
+
+따라서 앞 예의 slot mapping은 `[192, 48, 49, 158, 159, 64]`가 된다. 예를 들어
+`C15`는 physical block 9의 offset 15이므로 `9 * 16 + 15 = 159`이고, 바로 다음
+`C16`은 physical block 4의 offset 0이므로 `4 * 16 = 64`다. C의 input slice는
+메모리에서 연속이지만, KV cache write는 page 경계에서 다른 physical block으로
+간다.
+
+이 `slot_id`는 token이 들어갈 KV page와 page 안 위치를 지정하는 논리 slot이지
+raw byte address가 아니다. K와 V는 layer별, head별, `head_size`별 vector다. 예를
+들어 FlashAttention backend에서는 cache layout이 NHD이면 개념상
+`[num_blocks, block_size, num_kv_heads, head_size]`이고, HND layout은 head와
+block-size 축의 순서가 다르다. 다른 backend나 cache group은 layout이 달라질 수
+있다.
+
+아래는 masking과 context parallelism을 뺀 일반 경우의 계산이다.
+`BlockTables.compute_slot_mappings`의 Triton kernel이 같은 관계를 구현한다.
+
+```python
+block_indices = local_positions // kv_block_size
+block_offsets = local_positions % kv_block_size
+block_numbers = tl.load(
+    block_table_ptr + req_state_idx * block_table_stride + block_indices,
+    # ...
+)
+slot_ids = block_numbers * kv_block_size + block_offsets
+```
+
+전체 구현은 [`block_table.py:198-353`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/block_table.py#L198-L353)에 있다. `prepare_attn`은
+`idx_mapping`으로 지속 block table에서 이번 batch의 row를 gather하고, 이 slot
+mapping을 만든다. shape와 호출은
+[`model_runner.py:1568-1587`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1568-L1587)에 있다.
+
+FlashAttention backend를 예로 들면, `do_kv_cache_update`가 이 slot mapping을
+`reshape_and_cache_flash`에 넘겨 K/V를 scatter write한다. C++ kernel은 slot을
+`block_idx`와 `block_offset`으로 나눈 뒤 block/page/head stride를 써 vector 주소를
+계산한다. 이는 한 backend의 구체적 구현이며 모든 attention backend가 같은 kernel을
+쓴다는 뜻은 아니다. Python 호출은
+[`flash_attn.py:1427-1463`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/attention/backends/flash_attn.py#L1427-L1463),
+kernel은 [`cache_kernels.cu:325-395`](https://github.com/vllm-project/vllm/blob/v0.32.0/csrc/cache_kernels.cu#L325-L395)에 있다.
+
+#### block은 scheduler가 소유하고 reference count로 재사용한다
+
+CPU의 [`KVCacheBlock`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/kv_cache_utils.py#L176-L206)은
+`block_id`, `ref_cnt`, prefix hash, free-list 연결을 담은 관리용 객체다.
+K/V vector 자체는 별도의 cache tensor에 있다. Python block 객체를 여러 개 만드는
+작업과 GPU tensor를 매번 새로 할당하는 작업을 구분해야 한다.
+
+일반 attention의 새 블록 계산은
+[`allocate_new_blocks`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/single_type_kv_cache_manager.py#L369-L410)에서 볼 수 있다.
+다음은 copy-on-write 분기를 생략한 핵심 계산이다.
+
+```python
+req_blocks = self.req_to_blocks[request_id]
+num_required_blocks = cdiv(num_tokens, self.block_size)
+num_new_blocks = num_required_blocks - len(req_blocks)
+```
+
+`cdiv`는 나눗셈 결과를 올림한다. 예를 들어 16개 position의 공간을 가진 요청이
+17번째 position을 필요로 하면 `ceil(17 / 16) = 2`개 블록이 필요하다.
+기존 블록이 하나이면 pool에서 새 블록 하나를 받아 ID 목록 뒤에 붙인다.
+마지막 블록의 남은 15칸은 이후 token을 위한 공간이며, forward에 padding token
+15개를 넣어 계산한다는 뜻은 아니다. hybrid cache와 speculative lookahead에서는
+필요한 공간을 정하는 추가 조건이 있다.
+
+`Scheduler.schedule`은 계산할 token 수를 고른 뒤 `KVCacheManager.allocate_slots`로
+필요한 block을 얻는다. 이때 새 block ID는 `NewRequestData.block_ids` 또는
+`CachedRequestData.new_block_ids`를 통해 worker에 전달된다. worker의
+`add_requests`와 `update_requests`는 이를 지속 `BlockTables`에 기록한다. 관련
+코드는 [`scheduler.py:591-805`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/sched/scheduler.py#L591-L805),
+[`model_runner.py:1181-1263`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1181-L1263)에 있다.
+
+prefix cache hit는 여러 request가 한 physical block을 참조하게 할 수 있다.
+block pool은 이때 `ref_cnt`를 올린다. request가 끝나면 `free_blocks`가 count를
+내리고 0이 된 block만 free queue에 넣는다. 이 구현은
+[`block_pool.py:742-805`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/block_pool.py#L742-L805)에
+있다. 따라서 block을 free한다는 말은 보통 GPU allocation을 즉시 해제한다는 뜻이
+아니라, 다음 요청이 같은 KV page를 재사용할 수 있게 한다는 뜻이다.
+
+#### CUDA graph와 backend 제약에서는 padding이 남아 있다
+
+가변 길이 packing은 일반 forward의 token 낭비를 줄이지만 padding이 완전히 사라진
+것은 아니다. `prepare_inputs`는 CUDA graph descriptor가 요구하는 token 수와
+request 수에 맞춰 `num_tokens_after_padding`과 `num_reqs_after_padding`을 정한다.
+block table gather kernel은 padded request row를 0으로 만들고 slot-mapping kernel은
+padded token을 `PAD_SLOT_ID`로 채운다. 관련 코드는
+[`input_batch.py:18-104`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/input_batch.py#L18-L104),
+[`model_runner.py:1354-1546`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/model_runner.py#L1354-L1546),
+[`block_table.py:248-353`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/worker/gpu/block_table.py#L248-L353)에 있다.
+
+그러므로 "예전에는 패딩, 지금은 16-token block"처럼 둘 중 하나만 있는 변화로
+보면 실제 구현을 놓친다. v0.32.0은 실행할 실제 token을 가변 길이로 pack하고,
+KV state는 page/block으로 관리하며, graph capture와 일부 backend 제약에서는
+별도로 padding을 사용한다.
 
 ### 8. scheduler가 token 결과를 요청별 출력으로 복원한다
 
 `Scheduler.update_from_output`은 sampled IDs와 logprob을 request별로 매핑하고
 요청 상태를 갱신한다. 구현은
-[`scheduler.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2026-L2140)에
+[`scheduler.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/sched/scheduler.py#L2026-L2140)에
 있다. 완료 조건, stop token, max tokens, 오류를 처리한 뒤 client index별
 `EngineCoreOutput`를 만들고 `EngineCoreOutputs`로 묶는다. 정상 완료는 이 경로에서
 `_free_request`를 호출한다.
@@ -701,7 +1026,7 @@ for output in outputs.items() if outputs else ():
 ```
 
 코드는
-[`core.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/core.py#L1603-L1615)에
+[`core.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/core.py#L1603-L1615)에
 있다. API process의 output handler는 `get_output_async`로 이를 받고
 `OutputProcessor.process_outputs`에 넘긴다.
 
@@ -716,7 +1041,7 @@ processed_outputs = output_processor.process_outputs(
 ```
 
 이 background loop는
-[`async_llm.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/async_llm.py#L826-L909)에
+[`async_llm.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/async_llm.py#L826-L909)에
 있다.
 
 ### 9. `OutputProcessor`가 ID를 text로 바꾸고 generator를 깨운다
@@ -724,7 +1049,7 @@ processed_outputs = output_processor.process_outputs(
 `OutputProcessor.process_outputs`는 새 token ID를 detokenizer에 넣어 text로
 바꾼다. stop string도 이 지점에서 판단하고, 필요한 token을 잘라 낸다. 이어서
 `RequestOutput`을 collector queue에 넣는다. 구현은
-[`output_processor.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/engine/output_processor.py#L681-L820)에
+[`output_processor.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/engine/output_processor.py#L681-L820)에
 있다.
 
 stop string으로 끝난 요청은 frontend가 `abort_requests_async`도 보낸다. 그래야
@@ -734,7 +1059,7 @@ streaming이면 `chat_completion_stream_generator`가 각 `RequestOutput`을 cha
 chunk로 만들고 `data: ...\n\n`을 보낸다. 마지막에 `data: [DONE]\n\n`을 보낸다.
 non-streaming이면 `chat_completion_full_generator`가 generator를 끝까지 소비한 뒤
 최종 text, tool call, usage를 `ChatCompletionResponse` JSON으로 만든다. 두 함수는
-[`serving.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/entrypoints/openai/chat_completion/serving.py#L466-L1240)에
+[`serving.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/openai/chat_completion/serving.py#L466-L1240)에
 있다.
 
 예시 요청에 `"stream": true`를 추가하면 SSE 경로를 확인할 수 있다.
@@ -748,7 +1073,7 @@ non-streaming이면 `chat_completion_full_generator`가 generator를 끝까지 �
 `finish_requests`가 request를 waiting, running queue에서 제거하고 `_free_request`를
 호출한다. `_free_request`는 `_free_blocks`, `_free_request_blocks`,
 `KVCacheManager.free` 순서로 request의 KV blocks를 cache manager에 반납한다. 구현은
-[`scheduler.py`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py#L2649-L2780)에
+[`scheduler.py`](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/v1/core/sched/scheduler.py#L2649-L2780)에
 있다.
 
 여기서 free는 CUDA allocator에 즉시 메모리 반환을 뜻하지 않는다. vLLM block pool이
@@ -832,11 +1157,11 @@ VLLM_USE_PRECOMPILED=1 uv pip install --python .venv/bin/python -e . --torch-bac
 .venv/bin/python -c "import vllm; print(vllm.__file__)"
 .venv/bin/python -c "import importlib.metadata as m; print(m.version('vllm'))"
 MODEL_PATH=/path/to/chat-model
-.venv/bin/vllm serve "$MODEL_PATH" --host 127.0.0.1 --served-model-name walkthrough
+VLLM_USE_RUST_FRONTEND=0 .venv/bin/vllm serve "$MODEL_PATH" --host 127.0.0.1 --served-model-name walkthrough
 ```
 
 `VLLM_USE_PRECOMPILED=1`은
-[`determine_wheel_url`](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/setup.py#L988-L1086)로
+[`determine_wheel_url`](https://github.com/vllm-project/vllm/blob/v0.32.0/setup.py#L988-L1086)로
 native artifact를 선택할 수 있다. 여기서는 실제 artifact의 commit provenance를
 확인하지 않았다. Python source revision만으로 실행된 native kernel의 revision을
 증명할 수 없다.
